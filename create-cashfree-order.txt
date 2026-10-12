@@ -1,0 +1,782 @@
+
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+type CashfreeEnvironment = "sandbox" | "production";
+
+type CashfreeConfig = {
+  environment: CashfreeEnvironment;
+  clientId: string;
+  clientSecret: string;
+  baseUrl: string;
+};
+
+function jsonResponse(data: unknown, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...corsHeaders,
+      "Content-Type": "application/json",
+    },
+  });
+}
+
+function supabaseHeaders(serviceKey: string) {
+  return {
+    apikey: serviceKey,
+    Authorization: `Bearer ${serviceKey}`,
+    "Content-Type": "application/json",
+  };
+}
+
+function getCashfreeConfig(
+  productCode: string,
+): CashfreeConfig {
+  let environment: CashfreeEnvironment;
+
+  if (
+    productCode === "upsc_complete_notes" ||
+    productCode === "upsc_complete_notes_99" ||
+    productCode === "opd_mastery"
+  ) {
+    environment = "production";
+  } else if (productCode === "anime_reel_bundle") {
+    environment = "sandbox";
+  } else {
+    throw new Error(
+      `Cashfree environment is not configured for product: ${productCode}`,
+    );
+  }
+
+  const prefix =
+    environment === "production"
+      ? "CASHFREE_PRODUCTION"
+      : "CASHFREE_SANDBOX";
+
+  const clientId = Deno.env.get(`${prefix}_CLIENT_ID`);
+  const clientSecret = Deno.env.get(`${prefix}_CLIENT_SECRET`);
+
+  if (!clientId || !clientSecret) {
+    throw new Error(
+      `Cashfree ${environment} credentials are not configured`,
+    );
+  }
+
+  return {
+    environment,
+    clientId,
+    clientSecret,
+    baseUrl:
+      environment === "production"
+        ? "https://api.cashfree.com/pg"
+        : "https://sandbox.cashfree.com/pg",
+  };
+}
+
+function validIntegerPrice(value: unknown): boolean {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0;
+}
+
+async function readJsonResponse(response: Response): Promise<any> {
+  const text = await response.text();
+
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    return { message: text || "Empty response" };
+  }
+}
+
+async function updateOrderStatus(
+  supabaseUrl: string,
+  serviceKey: string,
+  orderId: string,
+  status: string,
+): Promise<boolean> {
+  const params = new URLSearchParams({
+    payment_provider: "eq.cashfree",
+    provider_order_id: `eq.${orderId}`,
+  });
+
+  const response = await fetch(
+    `${supabaseUrl}/rest/v1/orders?${params.toString()}`,
+    {
+      method: "PATCH",
+      headers: {
+        ...supabaseHeaders(serviceKey),
+        Prefer: "return=representation",
+      },
+      body: JSON.stringify({
+        payment_status: status,
+        updated_at: new Date().toISOString(),
+      }),
+    },
+  );
+
+  if (!response.ok) {
+    console.error(
+      "Order status update error:",
+      await response.text(),
+    );
+    return false;
+  }
+
+  const rows = await response.json();
+
+  if (!Array.isArray(rows) || rows.length !== 1) {
+    console.error(
+      "Expected exactly one order status update; rows:",
+      Array.isArray(rows) ? rows.length : "invalid response",
+    );
+    return false;
+  }
+
+  return true;
+}
+
+async function getActiveProduct(
+  supabaseUrl: string,
+  serviceKey: string,
+  productCode: string,
+) {
+  const params = new URLSearchParams({
+    select:
+      "product_code,title,base_price_inr,upsell_enabled,upsell_price_inr,upsell_product_code,return_origin,is_active",
+    product_code: `eq.${productCode}`,
+    is_active: "eq.true",
+    limit: "1",
+  });
+
+  const response = await fetch(
+    `${supabaseUrl}/rest/v1/products?${params.toString()}`,
+    {
+      method: "GET",
+      headers: supabaseHeaders(serviceKey),
+    },
+  );
+
+  if (!response.ok) {
+    console.error(
+      "Product lookup error:",
+      await response.text(),
+    );
+    throw new Error("Could not load product configuration");
+  }
+
+  const products = await response.json();
+  return products[0] || null;
+}
+
+async function getSavedOrder(
+  supabaseUrl: string,
+  serviceKey: string,
+  orderId: string,
+) {
+  const params = new URLSearchParams({
+    select:
+      "product_code,amount_inr,payment_status,cashfree_environment",
+    payment_provider: "eq.cashfree",
+    provider_order_id: `eq.${orderId}`,
+    limit: "2",
+  });
+
+  const response = await fetch(
+    `${supabaseUrl}/rest/v1/orders?${params.toString()}`,
+    {
+      method: "GET",
+      headers: supabaseHeaders(serviceKey),
+    },
+  );
+
+  if (!response.ok) {
+    console.error(
+      "Database order lookup error:",
+      await response.text(),
+    );
+    throw new Error("Could not verify order record");
+  }
+
+  const rows = await response.json();
+
+  if (!Array.isArray(rows) || rows.length > 1) {
+    throw new Error("Order record is missing or ambiguous");
+  }
+
+  return rows[0] || null;
+}
+
+async function verifyCashfreeOrder(
+  config: CashfreeConfig,
+  orderId: string,
+) {
+  const response = await fetch(
+    `${config.baseUrl}/orders/${encodeURIComponent(orderId)}`,
+    {
+      method: "GET",
+      headers: {
+        "x-api-version": "2025-01-01",
+        "x-client-id": config.clientId,
+        "x-client-secret": config.clientSecret,
+      },
+    },
+  );
+
+  const result = await readJsonResponse(response);
+
+  if (!response.ok) {
+    console.error("Cashfree verification error:", {
+      environment: config.environment,
+      status: response.status,
+      result,
+    });
+
+    return {
+      ok: false,
+      httpStatus: response.status,
+      result,
+    };
+  }
+
+  return {
+    ok: true,
+    httpStatus: response.status,
+    result,
+  };
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
+
+  if (req.method !== "POST") {
+    return jsonResponse({ error: "Method not allowed" }, 405);
+  }
+
+  try {
+    const body = await req.json();
+
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceKey = Deno.env.get(
+      "OPD_STORAGE_SERVICE_ROLE_KEY",
+    );
+
+    if (!supabaseUrl || !serviceKey) {
+      return jsonResponse(
+        { error: "Supabase server credentials are not configured" },
+        500,
+      );
+    }
+
+    // =========================================================
+    // CONFIG
+    // =========================================================
+
+    if (body.action === "config") {
+      const productCode = String(
+        body.product_code || body.productCode || "",
+      ).trim();
+
+      if (!productCode) {
+        return jsonResponse(
+          { error: "product_code is required" },
+          400,
+        );
+      }
+
+      const product = await getActiveProduct(
+        supabaseUrl,
+        serviceKey,
+        productCode,
+      );
+
+      if (!product) {
+        return jsonResponse(
+          { error: "Product not found or inactive" },
+          404,
+        );
+      }
+
+      const basePrice = Number(product.base_price_inr);
+
+      const upsellPrice =
+        product.upsell_price_inr === null ||
+        product.upsell_price_inr === undefined
+          ? null
+          : Number(product.upsell_price_inr);
+
+      if (!validIntegerPrice(basePrice)) {
+        return jsonResponse(
+          { error: "Product base price configuration is invalid" },
+          500,
+        );
+      }
+
+      if (
+        upsellPrice !== null &&
+        (!Number.isInteger(upsellPrice) || upsellPrice < 0)
+      ) {
+        return jsonResponse(
+          { error: "Product upsell price configuration is invalid" },
+          500,
+        );
+      }
+
+      return jsonResponse({
+        product_code: product.product_code,
+        title: product.title,
+        base_price_inr: basePrice,
+        upsell_enabled: product.upsell_enabled === true,
+        upsell_price_inr: upsellPrice,
+        upsell_product_code: product.upsell_product_code || null,
+      });
+    }
+
+    // =========================================================
+    // VERIFY PAYMENT
+    // =========================================================
+
+    if (body.action === "verify") {
+      const orderId = String(body.orderId || "").trim();
+
+      if (!orderId) {
+        return jsonResponse(
+          { error: "orderId is required" },
+          400,
+        );
+      }
+
+      const savedOrder = await getSavedOrder(
+        supabaseUrl,
+        serviceKey,
+        orderId,
+      );
+
+      if (!savedOrder) {
+        return jsonResponse({
+          verified: false,
+          status: "NOT_FOUND",
+          order_id: orderId,
+        });
+      }
+
+      const savedEnvironment = String(
+        savedOrder.cashfree_environment || "",
+      ).trim().toLowerCase();
+
+      // Never guess the environment for legacy orders.
+      if (
+        savedEnvironment !== "production" &&
+        savedEnvironment !== "sandbox"
+      ) {
+        return jsonResponse(
+          {
+            verified: false,
+            error:
+              "Order environment is not recorded. Contact support to verify this order.",
+          },
+          409,
+        );
+      }
+
+      const expectedConfig = getCashfreeConfig(
+        String(savedOrder.product_code || "").trim(),
+      );
+
+      // Ensure the database's saved environment agrees with
+      // the fixed server-side mapping for this product.
+      if (savedEnvironment !== expectedConfig.environment) {
+        console.error("Order environment mismatch:", {
+          orderId,
+          savedEnvironment,
+          expectedEnvironment: expectedConfig.environment,
+        });
+
+        return jsonResponse(
+          {
+            verified: false,
+            error: "Order environment configuration mismatch",
+          },
+          409,
+        );
+      }
+
+      const verification = await verifyCashfreeOrder(
+        expectedConfig,
+        orderId,
+      );
+
+      if (!verification.ok) {
+        return jsonResponse(
+          {
+            error: "Payment verification failed",
+            verified: false,
+          },
+          502,
+        );
+      }
+
+      const result = verification.result;
+
+      const status = String(
+        result.order_status || "",
+      ).toUpperCase();
+
+      const cashfreeAmount = Number(result.order_amount);
+      const savedAmount = Number(savedOrder.amount_inr);
+      const currency = String(
+        result.order_currency || "",
+      ).toUpperCase();
+
+      const amountMatches =
+        Number.isFinite(cashfreeAmount) &&
+        Number.isFinite(savedAmount) &&
+        cashfreeAmount === savedAmount &&
+        currency === "INR";
+
+      if (status === "PAID" && amountMatches) {
+        const updated = await updateOrderStatus(
+          supabaseUrl,
+          serviceKey,
+          orderId,
+          "paid",
+        );
+
+        if (!updated) {
+          return jsonResponse(
+            {
+              error:
+                "Payment is paid, but order status could not be saved",
+              verified: false,
+            },
+            500,
+          );
+        }
+
+        return jsonResponse({
+          verified: true,
+          status,
+          order_id: orderId,
+          amount: savedAmount,
+          product_code: savedOrder.product_code,
+        });
+      }
+
+      if (
+        status === "EXPIRED" ||
+        status === "CANCELLED" ||
+        status === "TERMINATED"
+      ) {
+        const updated = await updateOrderStatus(
+          supabaseUrl,
+          serviceKey,
+          orderId,
+          "failed",
+        );
+
+        if (!updated) {
+          return jsonResponse(
+            {
+              error: "Could not save failed payment status",
+              verified: false,
+            },
+            500,
+          );
+        }
+      }
+
+      return jsonResponse({
+        verified: false,
+        status: amountMatches ? status : "AMOUNT_MISMATCH",
+        order_id: orderId,
+      });
+    }
+
+    // =========================================================
+    // CREATE ORDER
+    // =========================================================
+
+    if (body.action === "create") {
+      const name = String(body.name || "").trim();
+      const email = String(body.email || "").trim();
+      const phone = String(body.phone || "").trim();
+
+      const productCode = String(
+        body.product_code || body.productCode || "",
+      ).trim();
+
+      const orderBump =
+        body.order_bump === true ||
+        body.order_bump === "true" ||
+        body.orderBump === true;
+
+      if (!name || !email || !phone) {
+        return jsonResponse(
+          { error: "Name, email and phone are required" },
+          400,
+        );
+      }
+
+      if (!productCode) {
+        return jsonResponse(
+          { error: "product_code is required" },
+          400,
+        );
+      }
+
+      const product = await getActiveProduct(
+        supabaseUrl,
+        serviceKey,
+        productCode,
+      );
+
+      if (!product) {
+        return jsonResponse(
+          { error: "Product not found or inactive" },
+          404,
+        );
+      }
+
+      // Server-controlled environment and credentials.
+      const cashfreeConfig = getCashfreeConfig(
+        product.product_code,
+      );
+
+      const basePrice = Number(product.base_price_inr);
+
+      if (!validIntegerPrice(basePrice)) {
+        return jsonResponse(
+          { error: "Product base price configuration is invalid" },
+          500,
+        );
+      }
+
+      // Validate the optional order bump.
+      let bumpPrice = 0;
+
+      if (orderBump) {
+        if (product.upsell_enabled !== true) {
+          return jsonResponse(
+            { error: "Order bump is not available for this product" },
+            400,
+          );
+        }
+
+        const configuredBumpPrice = Number(
+          product.upsell_price_inr,
+        );
+
+        if (
+          !Number.isInteger(configuredBumpPrice) ||
+          configuredBumpPrice <= 0
+        ) {
+          return jsonResponse(
+            { error: "Product upsell price configuration is invalid" },
+            500,
+          );
+        }
+
+        // Supports linked upsell products and upsell-only
+        // files stored against the same product.
+        const upsellProductCode = String(
+          product.upsell_product_code || "",
+        ).trim();
+
+        if (upsellProductCode) {
+          const upsellProduct = await getActiveProduct(
+            supabaseUrl,
+            serviceKey,
+            upsellProductCode,
+          );
+
+          if (!upsellProduct) {
+            return jsonResponse(
+              {
+                error:
+                  "Configured upsell product is not active or does not exist",
+              },
+              500,
+            );
+          }
+        }
+
+        bumpPrice = configuredBumpPrice;
+      }
+
+      const amount = basePrice + bumpPrice;
+
+      if (!Number.isInteger(amount) || amount <= 0) {
+        return jsonResponse(
+          { error: "Product pricing configuration is invalid" },
+          500,
+        );
+      }
+
+      // Unique order ID.
+      const orderId =
+        `order_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`;
+
+      // Validate return origin before creating the database order.
+      const configuredOrigin = String(
+        product.return_origin || "",
+      ).trim();
+
+      if (!configuredOrigin) {
+        return jsonResponse(
+          { error: "Product return URL is not configured" },
+          500,
+        );
+      }
+
+      let liveOrigin: string;
+
+      try {
+        const parsedOrigin = new URL(configuredOrigin);
+
+        if (parsedOrigin.protocol !== "https:") {
+          throw new Error("Return URL must use HTTPS");
+        }
+
+        liveOrigin = parsedOrigin.origin;
+      } catch {
+        return jsonResponse(
+          { error: "Invalid product return URL configuration" },
+          500,
+        );
+      }
+
+      // Save environment with the pending order.
+      const insertResponse = await fetch(
+        `${supabaseUrl}/rest/v1/orders`,
+        {
+          method: "POST",
+          headers: {
+            ...supabaseHeaders(serviceKey),
+            Prefer: "return=minimal",
+          },
+          body: JSON.stringify({
+            product_code: product.product_code,
+            payment_provider: "cashfree",
+            provider_order_id: orderId,
+            amount_inr: amount,
+            upsell_selected: orderBump,
+            payment_status: "pending",
+            cashfree_environment: cashfreeConfig.environment,
+          }),
+        },
+      );
+
+      if (!insertResponse.ok) {
+        console.error(
+          "Order record insert error:",
+          await insertResponse.text(),
+        );
+
+        return jsonResponse(
+          { error: "Could not save order record" },
+          500,
+        );
+      }
+
+      // Create the Cashfree order in the selected environment.
+      const cashfreeResponse = await fetch(
+        `${cashfreeConfig.baseUrl}/orders`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-version": "2025-01-01",
+            "x-client-id": cashfreeConfig.clientId,
+            "x-client-secret": cashfreeConfig.clientSecret,
+          },
+          body: JSON.stringify({
+            order_id: orderId,
+            order_amount: amount,
+            order_currency: "INR",
+            customer_details: {
+              customer_id: `customer_${Date.now()}`,
+              customer_name: name,
+              customer_email: email,
+              customer_phone: phone,
+            },
+            order_meta: {
+              return_url:
+                `${liveOrigin}/payment-result?order_id=${encodeURIComponent(orderId)}`,
+            },
+          }),
+        },
+      );
+
+      const result = await readJsonResponse(cashfreeResponse);
+
+      if (!cashfreeResponse.ok) {
+        console.error("Cashfree order creation error:", {
+          environment: cashfreeConfig.environment,
+          status: cashfreeResponse.status,
+          result,
+        });
+
+        await updateOrderStatus(
+          supabaseUrl,
+          serviceKey,
+          orderId,
+          "failed",
+        );
+
+        return jsonResponse(
+          {
+            error: "Cashfree order creation failed",
+            details:
+              result.message ||
+              result.type ||
+              "Unknown Cashfree error",
+          },
+          502,
+        );
+      }
+
+      if (!result.payment_session_id) {
+        await updateOrderStatus(
+          supabaseUrl,
+          serviceKey,
+          orderId,
+          "failed",
+        );
+
+        return jsonResponse(
+          { error: "Cashfree did not return a payment session" },
+          502,
+        );
+      }
+
+      return jsonResponse({
+        order_id: orderId,
+        payment_session_id: result.payment_session_id,
+        order_amount: amount,
+        product_code: product.product_code,
+        upsell_selected: orderBump,
+      });
+    }
+
+    return jsonResponse({ error: "Invalid action" }, 400);
+  } catch (error) {
+    console.error("Function error:", error);
+
+    return jsonResponse(
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : "Server error",
+      },
+      500,
+    );
+  }
+});

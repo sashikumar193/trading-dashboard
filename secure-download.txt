@@ -1,0 +1,603 @@
+
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers":
+    "authorization, x-client-info, apikey, content-type",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+
+type CashfreeEnvironment = "sandbox" | "production";
+
+type CashfreeConfig = {
+  environment: CashfreeEnvironment;
+  clientId: string;
+  clientSecret: string;
+  baseUrl: string;
+};
+
+type SavedOrder = {
+  product_code: string;
+  provider_order_id: string;
+  amount_inr: number;
+  upsell_selected: boolean;
+  payment_status: string;
+  cashfree_environment: string | null;
+};
+
+type ProductConfig = {
+  product_code: string;
+  title: string;
+  upsell_product_code: string | null;
+  is_active: boolean;
+};
+
+type ProductFile = {
+  product_code: string;
+  storage_bucket: string | null;
+  storage_path: string | null;
+  upsell_only: boolean;
+  is_active: boolean;
+  delivery_type: string | null;
+  delivery_url: string | null;
+};
+
+function jsonResponse(data: unknown, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...corsHeaders,
+      "Content-Type": "application/json",
+    },
+  });
+}
+
+function supabaseHeaders(serviceKey: string) {
+  return {
+    apikey: serviceKey,
+    Authorization: `Bearer ${serviceKey}`,
+    "Content-Type": "application/json",
+  };
+}
+
+function encodeStoragePath(path: string) {
+  return path
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/");
+}
+
+function getCashfreeConfig(
+  productCode: string,
+): CashfreeConfig {
+  let environment: CashfreeEnvironment;
+
+  if (
+    productCode === "upsc_complete_notes" ||
+    productCode === "upsc_complete_notes_99" ||
+    productCode === "opd_mastery"
+  ) {
+    environment = "production";
+  } else if (productCode === "anime_reel_bundle") {
+    environment = "sandbox";
+  } else {
+    throw new Error(
+      `Cashfree environment is not configured for product: ${productCode}`,
+    );
+  }
+
+  const prefix =
+    environment === "production"
+      ? "CASHFREE_PRODUCTION"
+      : "CASHFREE_SANDBOX";
+
+  const clientId = Deno.env.get(`${prefix}_CLIENT_ID`);
+  const clientSecret = Deno.env.get(`${prefix}_CLIENT_SECRET`);
+
+  if (!clientId || !clientSecret) {
+    throw new Error(
+      `Cashfree ${environment} credentials are not configured`,
+    );
+  }
+
+  return {
+    environment,
+    clientId,
+    clientSecret,
+    baseUrl:
+      environment === "production"
+        ? "https://api.cashfree.com/pg"
+        : "https://sandbox.cashfree.com/pg",
+  };
+}
+
+async function readJsonResponse(response: Response): Promise<any> {
+  const text = await response.text();
+
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch {
+    return { message: text || "Empty response" };
+  }
+}
+
+async function getProduct(
+  supabaseUrl: string,
+  serviceKey: string,
+  productCode: string,
+): Promise<ProductConfig | null> {
+  const params = new URLSearchParams({
+    select:
+      "product_code,title,upsell_product_code,is_active",
+    product_code: `eq.${productCode}`,
+    is_active: "eq.true",
+    limit: "1",
+  });
+
+  const response = await fetch(
+    `${supabaseUrl}/rest/v1/products?${params.toString()}`,
+    {
+      method: "GET",
+      headers: supabaseHeaders(serviceKey),
+    },
+  );
+
+  if (!response.ok) {
+    console.error(
+      "Product lookup error:",
+      await response.text(),
+    );
+    throw new Error("Could not load product configuration");
+  }
+
+  const products = (await response.json()) as ProductConfig[];
+  return products[0] || null;
+}
+
+async function getProductFiles(
+  supabaseUrl: string,
+  serviceKey: string,
+  productCode: string,
+): Promise<ProductFile[]> {
+  const params = new URLSearchParams({
+    select:
+      "product_code,storage_bucket,storage_path,upsell_only,is_active,delivery_type,delivery_url",
+    product_code: `eq.${productCode}`,
+    is_active: "eq.true",
+  });
+
+  const response = await fetch(
+    `${supabaseUrl}/rest/v1/product_files?${params.toString()}`,
+    {
+      method: "GET",
+      headers: supabaseHeaders(serviceKey),
+    },
+  );
+
+  if (!response.ok) {
+    console.error(
+      "Product files lookup error:",
+      await response.text(),
+    );
+    throw new Error("Could not load product file configuration");
+  }
+
+  return (await response.json()) as ProductFile[];
+}
+
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", { headers: corsHeaders });
+  }
+
+  if (req.method !== "POST") {
+    return jsonResponse({ error: "Method not allowed" }, 405);
+  }
+
+  try {
+    const body = await req.json();
+    const orderId = String(body.orderId || "").trim();
+
+    if (!orderId) {
+      return jsonResponse({ error: "orderId is required" }, 400);
+    }
+
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceKey = Deno.env.get(
+      "OPD_STORAGE_SERVICE_ROLE_KEY",
+    );
+
+    if (!supabaseUrl || !serviceKey) {
+      return jsonResponse(
+        { error: "Supabase server credentials are not configured" },
+        500,
+      );
+    }
+
+    // =========================================================
+    // 1. FIND ORDER
+    // =========================================================
+
+    const orderParams = new URLSearchParams({
+      select:
+        "product_code,provider_order_id,amount_inr,upsell_selected,payment_status,cashfree_environment",
+      payment_provider: "eq.cashfree",
+      provider_order_id: `eq.${orderId}`,
+      limit: "2",
+    });
+
+    const orderResponse = await fetch(
+      `${supabaseUrl}/rest/v1/orders?${orderParams.toString()}`,
+      {
+        method: "GET",
+        headers: supabaseHeaders(serviceKey),
+      },
+    );
+
+    if (!orderResponse.ok) {
+      console.error(
+        "Order lookup error:",
+        await orderResponse.text(),
+      );
+      return jsonResponse({ error: "Could not look up order" }, 500);
+    }
+
+    const orders = (await orderResponse.json()) as SavedOrder[];
+
+    if (orders.length > 1) {
+      return jsonResponse(
+        { error: "Order record is ambiguous", verified: false },
+        409,
+      );
+    }
+
+    const savedOrder = orders[0];
+
+    if (!savedOrder) {
+      return jsonResponse(
+        { error: "Order not found", verified: false },
+        404,
+      );
+    }
+
+    // =========================================================
+    // 2. REQUIRE PAID ORDER
+    // =========================================================
+
+    if (
+      String(savedOrder.payment_status || "")
+        .trim()
+        .toLowerCase() !== "paid"
+    ) {
+      return jsonResponse(
+        { error: "Payment is not verified", verified: false },
+        403,
+      );
+    }
+
+    // =========================================================
+    // 3. SELECT AND VERIFY CORRECT CASHFREE ENVIRONMENT
+    // =========================================================
+
+    const productCode = String(
+      savedOrder.product_code || "",
+    ).trim();
+
+    if (!productCode) {
+      return jsonResponse(
+        { error: "Order has no product code", verified: false },
+        500,
+      );
+    }
+
+    const savedEnvironment = String(
+      savedOrder.cashfree_environment || "",
+    ).trim().toLowerCase();
+
+    // Do not guess an environment for older records.
+    if (
+      savedEnvironment !== "production" &&
+      savedEnvironment !== "sandbox"
+    ) {
+      return jsonResponse(
+        {
+          error:
+            "This order has no recorded Cashfree environment. Contact support for manual verification.",
+          verified: false,
+        },
+        409,
+      );
+    }
+
+    const cashfreeConfig = getCashfreeConfig(productCode);
+
+    if (savedEnvironment !== cashfreeConfig.environment) {
+      console.error("Cashfree environment mismatch:", {
+        orderId,
+        savedEnvironment,
+        expectedEnvironment: cashfreeConfig.environment,
+      });
+
+      return jsonResponse(
+        {
+          error: "Order environment configuration mismatch",
+          verified: false,
+        },
+        409,
+      );
+    }
+
+    const cashfreeResponse = await fetch(
+      `${cashfreeConfig.baseUrl}/orders/${encodeURIComponent(orderId)}`,
+      {
+        method: "GET",
+        headers: {
+          "x-api-version": "2025-01-01",
+          "x-client-id": cashfreeConfig.clientId,
+          "x-client-secret": cashfreeConfig.clientSecret,
+        },
+      },
+    );
+
+    const cashfreeOrder = await readJsonResponse(cashfreeResponse);
+
+    if (!cashfreeResponse.ok) {
+      console.error("Cashfree verification error:", {
+        environment: cashfreeConfig.environment,
+        status: cashfreeResponse.status,
+        result: cashfreeOrder,
+      });
+
+      return jsonResponse(
+        { error: "Unable to verify payment with Cashfree" },
+        502,
+      );
+    }
+
+    const cashfreeStatus = String(
+      cashfreeOrder.order_status || "",
+    ).trim().toUpperCase();
+
+    const cashfreeAmount = Number(cashfreeOrder.order_amount);
+    const savedAmount = Number(savedOrder.amount_inr);
+
+    const currency = String(
+      cashfreeOrder.order_currency || "",
+    ).trim().toUpperCase();
+
+    const amountMatches =
+      Number.isFinite(cashfreeAmount) &&
+      Number.isFinite(savedAmount) &&
+      cashfreeAmount === savedAmount &&
+      currency === "INR";
+
+    if (cashfreeStatus !== "PAID" || !amountMatches) {
+      return jsonResponse(
+        {
+          error:
+            "Payment details do not match or payment is not complete",
+          verified: false,
+        },
+        403,
+      );
+    }
+
+    // =========================================================
+    // 4. LOAD BASE PRODUCT
+    // =========================================================
+
+    const baseProduct = await getProduct(
+      supabaseUrl,
+      serviceKey,
+      productCode,
+    );
+
+    if (!baseProduct) {
+      return jsonResponse(
+        { error: "Product configuration not found" },
+        404,
+      );
+    }
+
+    // =========================================================
+    // 5. LOAD BASE FILES
+    // =========================================================
+
+    const baseFiles = await getProductFiles(
+      supabaseUrl,
+      serviceKey,
+      productCode,
+    );
+
+    const upsellSelected = savedOrder.upsell_selected === true;
+    const configuredFiles: ProductFile[] = [...baseFiles];
+
+    // =========================================================
+    // 6. LOAD LINKED UPSELL FILES
+    // =========================================================
+
+    if (upsellSelected && baseProduct.upsell_product_code) {
+      const upsellProductCode = String(
+        baseProduct.upsell_product_code,
+      ).trim();
+
+      const upsellProduct = await getProduct(
+        supabaseUrl,
+        serviceKey,
+        upsellProductCode,
+      );
+
+      if (!upsellProduct) {
+        return jsonResponse(
+          { error: "Upsell product configuration not found" },
+          500,
+        );
+      }
+
+      const upsellFiles = await getProductFiles(
+        supabaseUrl,
+        serviceKey,
+        upsellProductCode,
+      );
+
+      configuredFiles.push(...upsellFiles);
+    }
+
+    // =========================================================
+    // 7. FILTER ELIGIBLE FILES
+    // =========================================================
+
+    const eligibleFiles = configuredFiles.filter(
+      (file) =>
+        file.is_active === true &&
+        (file.upsell_only !== true || upsellSelected),
+    );
+
+    if (eligibleFiles.length === 0) {
+      return jsonResponse(
+        {
+          error:
+            "No active download files are configured for this product",
+        },
+        404,
+      );
+    }
+
+    // =========================================================
+    // 8. CREATE DOWNLOAD LINKS
+    // =========================================================
+
+    const downloads: {
+      name: string;
+      url: string;
+      delivery_type: string;
+      product_code: string;
+    }[] = [];
+
+    for (let index = 0; index < eligibleFiles.length; index++) {
+      const file = eligibleFiles[index];
+
+      const deliveryType = String(
+        file.delivery_type || "",
+      ).trim().toLowerCase();
+
+      // Google Drive delivery
+      if (deliveryType === "drive") {
+        const driveUrl = String(file.delivery_url || "").trim();
+
+        if (!driveUrl) {
+          console.error("Drive file missing delivery_url:", file);
+
+          return jsonResponse(
+            {
+              error:
+                "A Google Drive product file is missing its delivery URL",
+            },
+            500,
+          );
+        }
+
+        downloads.push({
+          name: `Access ${file.product_code}`,
+          url: driveUrl,
+          delivery_type: "drive",
+          product_code: file.product_code,
+        });
+
+        continue;
+      }
+
+      // Supabase Storage delivery
+      if (deliveryType && deliveryType !== "storage") {
+        return jsonResponse(
+          { error: `Unsupported delivery type: ${deliveryType}` },
+          500,
+        );
+      }
+
+      const bucket = String(file.storage_bucket || "").trim();
+      const path = String(file.storage_path || "").trim();
+
+      if (!bucket || !path) {
+        console.error(
+          "Invalid storage product file configuration:",
+          file,
+        );
+
+        return jsonResponse(
+          {
+            error:
+              "A configured storage file is missing its bucket or storage path",
+          },
+          500,
+        );
+      }
+
+      const signingResponse = await fetch(
+        `${supabaseUrl}/storage/v1/object/sign/${encodeURIComponent(bucket)}/${encodeStoragePath(path)}`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${serviceKey}`,
+            apikey: serviceKey,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ expiresIn: 600 }),
+        },
+      );
+
+      const signingResult = await readJsonResponse(signingResponse);
+
+      if (!signingResponse.ok || !signingResult.signedURL) {
+        console.error("Storage signing error:", signingResult);
+
+        return jsonResponse(
+          { error: "Could not create a secure download link" },
+          500,
+        );
+      }
+
+      const signedURL = String(signingResult.signedURL);
+
+      const downloadUrl = signedURL.startsWith("http://") ||
+          signedURL.startsWith("https://")
+        ? signedURL
+        : `${supabaseUrl}/storage/v1${
+            signedURL.startsWith("/") ? signedURL : `/${signedURL}`
+          }`;
+
+      downloads.push({
+        name:
+          path.split("/").pop() || `Download ${index + 1}`,
+        url: downloadUrl,
+        delivery_type: "storage",
+        product_code: file.product_code,
+      });
+    }
+
+    // =========================================================
+    // 9. RETURN VERIFIED DOWNLOADS
+    // =========================================================
+
+    return jsonResponse({
+      verified: true,
+      amount: savedAmount,
+      product_code: productCode,
+      upsell_selected: upsellSelected,
+      downloads,
+    });
+  } catch (error) {
+    console.error("Secure download error:", error);
+
+    return jsonResponse(
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : "Server error",
+      },
+      500,
+    );
+  }
+});
