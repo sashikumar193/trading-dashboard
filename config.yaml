@@ -1,0 +1,48 @@
+# ============================================================
+# Trading System Configuration
+# ============================================================
+
+mode: "backtest"          # backtest | paper | live
+
+# Global risk settings
+risk:
+  max_position_pct: 0.10          # Max % of equity per position
+  max_open_positions: 5
+  max_daily_loss_pct: 0.03        # Kill switch if daily loss exceeds this
+  max_drawdown_pct: 0.15          # Kill switch on equity drawdown
+  default_leverage: 1.0
+  risk_per_trade_pct: 0.01        # Risk 1% of equity per trade
+
+# Data settings
+data:
+  default_timeframe: "1h"
+  lookback_bars: 500
+  cache_dir: "./data/cache"
+
+# Backtest defaults
+backtest:
+  initial_capital: 10000
+  commission_pct: 0.001           # 0.1% round-trip typical for crypto
+  slippage_pct: 0.0005
+  start_date: "2024-01-01"
+  end_date: null                  # null = up to latest available
+
+# Live / Paper trading
+live:
+  exchange: "binance"             # ccxt exchange id
+  sandbox: true                   # true = testnet / paper
+  poll_interval_seconds: 30
+  symbols:
+    - "BTC/USDT"
+    - "ETH/USDT"
+
+# Notifications (optional)
+notifications:
+  telegram_enabled: false
+  telegram_token: ""
+  telegram_chat_id: ""
+
+# Logging
+logging:
+  level: "INFO"
+  file: "./logs/trading.log"
